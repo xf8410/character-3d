@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-gen.py —— character-3d 核心生成器。
+gen.py —— character-3d 核心生成器（自研，不依赖 3D API/GPU）。
 
-思路：把角色拆成多个部件（头/躯干/裙摆/双腿），每部件用三视图对应高度区间的
-      轮廓放样成椭圆柱/椭球，再用三向平面投影着色。目标是：剪影仍贴合原图，
-      但转角度能看出脖子、腰、裙摆、双腿，不再是单根胶囊。
+方法：从正/侧/背三视图提取轮廓，做单一连续椭圆柱放样（保证几何无缝），
+      再按归一化身高施加形态修饰（收腰/扩裙摆/封头顶），最后三向平面投影着色。
 """
 import json, os, math, base64, io
 import numpy as np
@@ -13,8 +12,8 @@ from PIL import Image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 H3D = 1.8
-M_BODY = 48      # 身体周向分段
-M_HEAD = 56      # 头更圆滑
+N = 72          # 高度层数
+M = 56          # 周向分段
 SCALE = 0.985
 TEX_W, TEX_H = 512, 768
 
@@ -41,77 +40,21 @@ def resample(rows, top, bot, n):
     cx = np.interp(ys, np.arange(len(rows)), rows[:,1])
     return ys, hw, cx
 
-# ---------------------------------------------------------------------------
-# 部件定义 (y0,y1 是 0~1 归一化高度; n 是高度层数)
-PARTS = [
-    {'name':'legs',  'y0':0.00, 'y1':0.40, 'n':26, 'm':M_BODY, 'shape':'cylinder'},
-    {'name':'skirt', 'y0':0.25, 'y1':0.60, 'n':22, 'm':M_BODY, 'shape':'cylinder'},
-    {'name':'torso', 'y0':0.50, 'y1':0.85, 'n':24, 'm':M_BODY, 'shape':'cylinder'},
-    {'name':'head',  'y0':0.80, 'y1':1.00, 'n':22, 'm':M_HEAD, 'shape':'cylinder'},
-]
+def smooth_bump(t, a, b):
+    if t <= a or t >= b: return 0.0
+    return math.sin((t-a)/(b-a) * math.pi)
 
-def build_part(fprof, sprof, bprof, cfg, charH, charHs):
-    """生成单个部件的 verts/faces/attributes。"""
-    fp, (ftop, fbot), (fH, fW) = fprof
-    sp, (stop, sbot), (sH, sW) = sprof
-    bp, (btop, bbot), (bH, bW) = bprof
-    n, m = cfg['n'], cfg['m']
-    y0p = ftop + cfg['y0']*(fbot-ftop)
-    y1p = ftop + cfg['y1']*(fbot-ftop)
-    fys, fhw, fcx = resample(fp, y0p, y1p, n)
-    sys_, shw, scx = resample(sp, stop + cfg['y0']*(sbot-stop), stop + cfg['y1']*(sbot-stop), n)
-    bys, bhw, bcx = resample(bp, btop + cfg['y0']*(bbot-btop), btop + cfg['y1']*(bbot-btop), n)
-
-    y3d = np.linspace(cfg['y0']*H3D, cfg['y1']*H3D, n)
-    verts, aRow, aCxF, aCxS, aCxB = [], [], [], [], []
-
-    # 形状修饰：裙摆/腰部/头部
-    for i in range(n):
-        t = i/(n-1)
-        xr0 = fhw[i] * (H3D / charH) * SCALE
-        zr0 = shw[i] * (H3D / charHs) * SCALE
-        # 局部收腰/扩摆
-        if cfg['name'] == 'skirt':
-            flare = 1.0 + 0.55*math.sin(t*math.pi)       # 裙摆中段外扩
-            xr, zr = xr0*flare, zr0*flare
-        elif cfg['name'] == 'torso':
-            waist = 0.85 + 0.15*math.sin(t*math.pi)      # 腰部略收
-            xr, zr = xr0*waist, zr0*waist
-        elif cfg['name'] == 'head':
-            # 头顶封顶：最上层半径渐缩成 0.35
-            cap = 1.0 - 0.65*(t**2.5)
-            xr, zr = xr0*cap, zr0*cap
-        else:
-            xr, zr = xr0, zr0
-        for j in range(m):
-            th = 2*math.pi*j/m
-            x = xr * math.cos(th)
-            z = zr * math.sin(th)
-            verts.append([x, y3d[i], z])
-            aRow.append(float(fys[i]))
-            aCxF.append(float(fcx[i]))
-            aCxS.append(float(scx[i]))
-            aCxB.append(float(bcx[i]))
-
-    # 封口（上顶、下底）
-    top_c = len(verts); verts.append([0, y3d[-1], 0])
-    aRow.append(float(fys[-1])); aCxF.append(fW/2); aCxS.append(sW/2); aCxB.append(bW/2)
-    bot_c = len(verts); verts.append([0, y3d[0], 0])
-    aRow.append(float(fys[0])); aCxF.append(fW/2); aCxS.append(sW/2); aCxB.append(bW/2)
-
-    faces = []
-    for i in range(n-1):
-        for j in range(m):
-            j2 = (j+1)%m
-            a = i*m + j; b = i*m + j2; c = (i+1)*m + j2; d = (i+1)*m + j
-            faces.append([a,b,c]); faces.append([a,c,d])
-    for j in range(m):
-        j2 = (j+1)%m
-        faces.append([top_c, j, j2])
-        faces.append([bot_c, (n-1)*m + j2, (n-1)*m + j])
-    return verts, faces, aRow, aCxF, aCxS, aCxB
-
-# ---------------------------------------------------------------------------
+def shape_mod(t):
+    """按归一化身高 t∈[0,1] 返回半径修饰系数（连续，保证无缝）。"""
+    m = 1.0
+    m *= 1.0 + 0.55*smooth_bump(t, 0.40, 0.62)   # 裙摆外扩
+    m *= 1.0 - 0.20*smooth_bump(t, 0.64, 0.78)   # 腰部内收
+    m *= 1.0 + 0.14*smooth_bump(t, 0.80, 0.86)   # 胸/肩外扩
+    m *= 1.0 - 0.32*smooth_bump(t, 0.87, 0.90)   # 颈部内收
+    if t > 0.90:                                  # 头顶封顶渐缩
+        cap = max(0.0, 1.0 - 2.4*(t-0.90)**1.2)
+        m *= cap
+    return m
 
 def resize_tex(path):
     im = Image.open(path).convert('RGB').resize((TEX_W, TEX_H), Image.LANCZOS)
@@ -123,23 +66,47 @@ def main():
     fprof = load_profile(os.path.join(HERE, 'views/front.png'))
     sprof = load_profile(os.path.join(HERE, 'views/side.png'))
     bprof = load_profile(os.path.join(HERE, 'views/back.png'))
-
-    fp, (ftop, fbot), _ = fprof
-    sp, (stop, sbot), _ = sprof
+    fp, (ftop, fbot), (fH, fW) = fprof
+    sp, (stop, sbot), (sH, sW) = sprof
+    bp, (btop, bbot), (bH, bW) = bprof
     charH = (fbot - ftop) or 1
     charHs = (sbot - stop) or 1
-
-    all_v, all_f, all_R, all_CF, all_CS, all_CB = [], [], [], [], [], []
-    off = 0
-    for cfg in PARTS:
-        v, f, R, CF, CS, CB = build_part(fprof, sprof, bprof, cfg, charH, charHs)
-        for face in f:
-            all_f.append([face[0]+off, face[1]+off, face[2]+off])
-        all_v += v; all_R += R; all_CF += CF; all_CS += CS; all_CB += CB
-        off += len(v)
-
     Kf = (charH / H3D) / SCALE
     Ks = (charHs / H3D) / SCALE
+
+    y3d = np.linspace(0, H3D, N)
+    fys, fhw, fcx = resample(fp, ftop, fbot, N)
+    sys_, shw, scx = resample(sp, stop, sbot, N)
+    bys, bhw, bcx = resample(bp, btop, bbot, N)
+
+    verts, aRow, aCxF, aCxS, aCxB = [], [], [], [], []
+    for i in range(N):
+        t = i/(N-1)
+        mod = shape_mod(t)
+        xr = fhw[i] * (H3D/charH) * SCALE * mod
+        zr = shw[i] * (H3D/charHs) * SCALE * mod
+        for j in range(M):
+            th = 2*math.pi*j/M
+            x = xr*math.cos(th); z = zr*math.sin(th)
+            verts.append([x, y3d[i], z])
+            aRow.append(float(fys[i])); aCxF.append(float(fcx[i]))
+            aCxS.append(float(scx[i])); aCxB.append(float(bcx[i]))
+
+    top_c = len(verts); verts.append([0, H3D, 0])
+    aRow.append(float(ftop)); aCxF.append(fW/2); aCxS.append(sW/2); aCxB.append(bW/2)
+    bot_c = len(verts); verts.append([0, 0, 0])
+    aRow.append(float(fbot)); aCxF.append(fW/2); aCxS.append(sW/2); aCxB.append(bW/2)
+
+    faces = []
+    for i in range(N-1):
+        for j in range(M):
+            j2 = (j+1)%M
+            a = i*M + j; b = i*M + j2; c = (i+1)*M + j2; d = (i+1)*M + j
+            faces.append([a,b,c]); faces.append([a,c,d])
+    for j in range(M):
+        j2 = (j+1)%M
+        faces.append([top_c, j, j2])
+        faces.append([bot_c, (N-1)*M + j2, (N-1)*M + j])
 
     tex = {
         'front': resize_tex(os.path.join(HERE, 'views/front.png')),
@@ -147,15 +114,11 @@ def main():
         'back':  resize_tex(os.path.join(HERE, 'views/back.png')),
     }
     geo = {
-        'v': all_v, 'f': all_f,
-        'aRow': all_R, 'aCxF': all_CF, 'aCxS': all_CS, 'aCxB': all_CB,
-        'Wf': fprof[2][1], 'Hf': fprof[2][0],
-        'Ws': sprof[2][1], 'Hs': sprof[2][0],
-        'Wb': bprof[2][1], 'Hb': bprof[2][0],
-        'Kf': Kf, 'Ks': Ks,
-        'H3D': H3D,
+        'v': verts, 'f': faces,
+        'aRow': aRow, 'aCxF': aCxF, 'aCxS': aCxS, 'aCxB': aCxB,
+        'Wf': fW, 'Hf': fH, 'Ws': sW, 'Hs': sH, 'Wb': bW, 'Hb': bH,
+        'Kf': Kf, 'Ks': Ks, 'H3D': H3D,
     }
-
     three = open(os.path.join(HERE, 'vendor/three.min.js'), encoding='utf-8').read()
     three = three.replace('</script', '<\\/script')
     html = TEMPLATE.replace('/*__THREE_JS__*/', three)\
@@ -163,7 +126,7 @@ def main():
                    .replace('/*__TEX__*/', json.dumps(tex, separators=(',',':')))
     out = os.path.join(HERE, 'index.html')
     open(out, 'w', encoding='utf-8').write(html)
-    print('wrote', out, os.path.getsize(out), 'bytes; verts', len(all_v), 'tris', len(all_f))
+    print('wrote', out, os.path.getsize(out), 'bytes; verts', len(verts), 'tris', len(faces))
 
 TEMPLATE = r"""<!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8">
@@ -172,18 +135,17 @@ TEMPLATE = r"""<!DOCTYPE html>
 <style>
 html,body{margin:0;height:100%;background:#11131a;overflow:hidden;font-family:system-ui,-apple-system,sans-serif;touch-action:none}
 #c{width:100%;height:100%;display:block}
-#hud{position:fixed;left:8px;top:8px;color:#cfd6e4;font-size:12px;background:rgba(0,0,0,.45);padding:8px 10px;border-radius:8px;max-width:calc(100% - 16px);box-sizing:border-box;pointer-events:auto}
-#hud b{font-size:13px}
+#hud{position:fixed;left:8px;top:8px;color:#cfd6e4;font-size:12px;background:rgba(0,0,0,.45);padding:8px 10px;border-radius:8px;max-width:calc(100% - 16px);box-sizing:border-box}
 #btns{margin-top:6px;display:flex;gap:6px;flex-wrap:wrap}
 button{background:#222838;color:#cfd6e4;border:1px solid #333b4d;border-radius:6px;padding:5px 10px;font-size:12px;touch-action:manipulation}
 #tip{font-size:11px;color:#8e99ae;margin-top:4px}
-#ref{position:fixed;left:8px;right:8px;bottom:8px;display:flex;gap:6px;justify-content:center;pointer-events:none}
-#ref img{height:70px;border:1px solid #2a2f3a;border-radius:4px;background:#fff;object-fit:contain;pointer-events:auto}
+#ref{position:fixed;left:8px;right:8px;bottom:8px;display:flex;gap:6px;justify-content:center}
+#ref img{height:70px;border:1px solid #2a2f3a;border-radius:4px;background:#fff;object-fit:contain}
 </style></head>
 <body>
 <canvas id="c"></canvas>
 <div id="hud">
-  <div><b>character-3d</b> · 分段重建</div>
+  <div><b>character-3d</b> · 三视图投影</div>
   <div id="btns"><button id="rot">⏸ 旋转</button><button id="wf">网格</button><button id="reset">重置</button></div>
   <div id="tip">拖拽旋转 · 滚轮缩放</div>
 </div>
@@ -214,7 +176,7 @@ geo.computeVertexNormals();
 function mkTex(url){
   const t = new THREE.Texture();
   const img = new Image();
-  img.onload = ()=>{ t.image = img; t.flipY = false; t.needsUpdate = true; };
+  img.onload = ()=>{ t.image = img; t.flipY = true; t.needsUpdate = true; };
   img.src = url;
   return t;
 }
@@ -246,7 +208,6 @@ const mat = new THREE.ShaderMaterial({
       vec3 cb = texture2D(backTex, vUb).rgb;
       vec3 cs = texture2D(sideTex, vUs).rgb;
       float nz = vN.z, nx = abs(vN.x);
-      // 硬切 + 小过渡：避免图腾柱混叠
       float wf = smoothstep(0.50, 0.72, nz);
       float wb = smoothstep(0.50, 0.72, -nz);
       float ws = smoothstep(0.62, 0.82, nx);
