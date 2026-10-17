@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-gen.py —— character-3d 项目核心生成器（自己从零实现，不依赖 3D API/GPU）。
+gen.py —— character-3d 核心生成器。
 
-思路：从正/侧/背三视图提取轮廓，放样出分段椭圆柱（头/躯干/裙摆/腿），
-      再用标准三向平面投影把参考图像素贴到对应朝向的表面。
+思路：把角色拆成多个部件（头/躯干/裙摆/双腿），每部件用三视图对应高度区间的
+      轮廓放样成椭圆柱/椭球，再用三向平面投影着色。目标是：剪影仍贴合原图，
+      但转角度能看出脖子、腰、裙摆、双腿，不再是单根胶囊。
 """
-import json, os, math, base64
+import json, os, math, base64, io
 import numpy as np
 from PIL import Image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 H3D = 1.8
-N = 64          # 高度层数（手机性能友好）
-M = 48          # 周向分段
-SCALE = 0.985   # 网格略小于轮廓
-TEX_W, TEX_H = 512, 768  # 贴图分辨率（手机友好）
+M_BODY = 48      # 身体周向分段
+M_HEAD = 56      # 头更圆滑
+SCALE = 0.985
+TEX_W, TEX_H = 512, 768
 
 def load_profile(path):
     im = np.array(Image.open(path).convert('RGB')).astype(np.float32)
@@ -40,27 +41,50 @@ def resample(rows, top, bot, n):
     cx = np.interp(ys, np.arange(len(rows)), rows[:,1])
     return ys, hw, cx
 
-def build_elliptical_mesh(fprof, sprof, bprof, segs=None):
-    """分段放样椭圆柱。segs 是 [(y0,y1, 是否闭合)] 列表；None 则整体一段。"""
-    if segs is None:
-        segs = [(0, N, False)]
-    verts, aRow, aCxF, aCxS, aCxB = [], [], [], [], []
-    y3d = np.linspace(0, H3D, N)
+# ---------------------------------------------------------------------------
+# 部件定义 (y0,y1 是 0~1 归一化高度; n 是高度层数)
+PARTS = [
+    {'name':'legs',  'y0':0.00, 'y1':0.40, 'n':26, 'm':M_BODY, 'shape':'cylinder'},
+    {'name':'skirt', 'y0':0.25, 'y1':0.60, 'n':22, 'm':M_BODY, 'shape':'cylinder'},
+    {'name':'torso', 'y0':0.50, 'y1':0.85, 'n':24, 'm':M_BODY, 'shape':'cylinder'},
+    {'name':'head',  'y0':0.80, 'y1':1.00, 'n':22, 'm':M_HEAD, 'shape':'cylinder'},
+]
+
+def build_part(fprof, sprof, bprof, cfg, charH, charHs):
+    """生成单个部件的 verts/faces/attributes。"""
     fp, (ftop, fbot), (fH, fW) = fprof
     sp, (stop, sbot), (sH, sW) = sprof
     bp, (btop, bbot), (bH, bW) = bprof
-    charH = (fbot - ftop) or 1
-    charHs = (sbot - stop) or 1
+    n, m = cfg['n'], cfg['m']
+    y0p = ftop + cfg['y0']*(fbot-ftop)
+    y1p = ftop + cfg['y1']*(fbot-ftop)
+    fys, fhw, fcx = resample(fp, y0p, y1p, n)
+    sys_, shw, scx = resample(sp, stop + cfg['y0']*(sbot-stop), stop + cfg['y1']*(sbot-stop), n)
+    bys, bhw, bcx = resample(bp, btop + cfg['y0']*(bbot-btop), btop + cfg['y1']*(bbot-btop), n)
 
-    fys, fhw, fcx = resample(fp, ftop, fbot, N)
-    sys_, shw, scx = resample(sp, stop, sbot, N)
-    bys, bhw, bcx = resample(bp, btop, bbot, N)
+    y3d = np.linspace(cfg['y0']*H3D, cfg['y1']*H3D, n)
+    verts, aRow, aCxF, aCxS, aCxB = [], [], [], [], []
 
-    for i in range(N):
-        xr = fhw[i] * (H3D / charH) * SCALE
-        zr = shw[i] * (H3D / charHs) * SCALE
-        for j in range(M):
-            th = 2*math.pi*j/M
+    # 形状修饰：裙摆/腰部/头部
+    for i in range(n):
+        t = i/(n-1)
+        xr0 = fhw[i] * (H3D / charH) * SCALE
+        zr0 = shw[i] * (H3D / charHs) * SCALE
+        # 局部收腰/扩摆
+        if cfg['name'] == 'skirt':
+            flare = 1.0 + 0.55*math.sin(t*math.pi)       # 裙摆中段外扩
+            xr, zr = xr0*flare, zr0*flare
+        elif cfg['name'] == 'torso':
+            waist = 0.85 + 0.15*math.sin(t*math.pi)      # 腰部略收
+            xr, zr = xr0*waist, zr0*waist
+        elif cfg['name'] == 'head':
+            # 头顶封顶：最上层半径渐缩成 0.35
+            cap = 1.0 - 0.65*(t**2.5)
+            xr, zr = xr0*cap, zr0*cap
+        else:
+            xr, zr = xr0, zr0
+        for j in range(m):
+            th = 2*math.pi*j/m
             x = xr * math.cos(th)
             z = zr * math.sin(th)
             verts.append([x, y3d[i], z])
@@ -69,39 +93,50 @@ def build_elliptical_mesh(fprof, sprof, bprof, segs=None):
             aCxS.append(float(scx[i]))
             aCxB.append(float(bcx[i]))
 
-    # 封口（简单扇形，仅顶部）
-    top_c = len(verts); verts.append([0, H3D, 0])
-    aRow.append(float(ftop)); aCxF.append(fW/2); aCxS.append(sW/2); aCxB.append(bW/2)
-    bot_c = len(verts); verts.append([0, 0, 0])
-    aRow.append(float(fbot)); aCxF.append(fW/2); aCxS.append(sW/2); aCxB.append(bW/2)
+    # 封口（上顶、下底）
+    top_c = len(verts); verts.append([0, y3d[-1], 0])
+    aRow.append(float(fys[-1])); aCxF.append(fW/2); aCxS.append(sW/2); aCxB.append(bW/2)
+    bot_c = len(verts); verts.append([0, y3d[0], 0])
+    aRow.append(float(fys[0])); aCxF.append(fW/2); aCxS.append(sW/2); aCxB.append(bW/2)
 
     faces = []
-    for i in range(N-1):
-        for j in range(M):
-            j2 = (j+1) % M
-            a = i*M + j; b = i*M + j2; c = (i+1)*M + j2; d = (i+1)*M + j
+    for i in range(n-1):
+        for j in range(m):
+            j2 = (j+1)%m
+            a = i*m + j; b = i*m + j2; c = (i+1)*m + j2; d = (i+1)*m + j
             faces.append([a,b,c]); faces.append([a,c,d])
-    for j in range(M):
-        j2 = (j+1) % M
+    for j in range(m):
+        j2 = (j+1)%m
         faces.append([top_c, j, j2])
-        faces.append([bot_c, (N-1)*M + j2, (N-1)*M + j])
-    return verts, faces, aRow, aCxF, aCxS, aCxB, fH, fW, sH, sW, bH, bW, charH, charHs
+        faces.append([bot_c, (n-1)*m + j2, (n-1)*m + j])
+    return verts, faces, aRow, aCxF, aCxS, aCxB
+
+# ---------------------------------------------------------------------------
 
 def resize_tex(path):
-    """缩放到 TEX_W x TEX_H 并 JPEG base64。"""
     im = Image.open(path).convert('RGB').resize((TEX_W, TEX_H), Image.LANCZOS)
-    buf = im.tobytes()
-    # 用 BytesIO 保存 JPEG
-    import io
     out = io.BytesIO()
-    im.save(out, 'JPEG', quality=82, optimize=True)
+    im.save(out, 'JPEG', quality=80, optimize=True)
     return 'data:image/jpeg;base64,' + base64.b64encode(out.getvalue()).decode()
 
 def main():
     fprof = load_profile(os.path.join(HERE, 'views/front.png'))
     sprof = load_profile(os.path.join(HERE, 'views/side.png'))
     bprof = load_profile(os.path.join(HERE, 'views/back.png'))
-    verts, faces, aRow, aCxF, aCxS, aCxB, fH, fW, sH, sW, bH, bW, charH, charHs = build_elliptical_mesh(fprof, sprof, bprof)
+
+    fp, (ftop, fbot), _ = fprof
+    sp, (stop, sbot), _ = sprof
+    charH = (fbot - ftop) or 1
+    charHs = (sbot - stop) or 1
+
+    all_v, all_f, all_R, all_CF, all_CS, all_CB = [], [], [], [], [], []
+    off = 0
+    for cfg in PARTS:
+        v, f, R, CF, CS, CB = build_part(fprof, sprof, bprof, cfg, charH, charHs)
+        for face in f:
+            all_f.append([face[0]+off, face[1]+off, face[2]+off])
+        all_v += v; all_R += R; all_CF += CF; all_CS += CS; all_CB += CB
+        off += len(v)
 
     Kf = (charH / H3D) / SCALE
     Ks = (charHs / H3D) / SCALE
@@ -112,23 +147,23 @@ def main():
         'back':  resize_tex(os.path.join(HERE, 'views/back.png')),
     }
     geo = {
-        'v': verts, 'f': faces,
-        'aRow': aRow, 'aCxF': aCxF, 'aCxS': aCxS, 'aCxB': aCxB,
-        'Wf': fW, 'Hf': fH, 'Ws': sW, 'Hs': sH, 'Wb': bW, 'Hb': bH,
+        'v': all_v, 'f': all_f,
+        'aRow': all_R, 'aCxF': all_CF, 'aCxS': all_CS, 'aCxB': all_CB,
+        'Wf': fprof[2][1], 'Hf': fprof[2][0],
+        'Ws': sprof[2][1], 'Hs': sprof[2][0],
+        'Wb': bprof[2][1], 'Hb': bprof[2][0],
         'Kf': Kf, 'Ks': Ks,
         'H3D': H3D,
     }
 
     three = open(os.path.join(HERE, 'vendor/three.min.js'), encoding='utf-8').read()
     three = three.replace('</script', '<\\/script')
-
-    html = TEMPLATE\
-        .replace('/*__THREE_JS__*/', three)\
-        .replace('/*__GEO__*/', json.dumps(geo, separators=(',',':')))\
-        .replace('/*__TEX__*/', json.dumps(tex, separators=(',',':')))
+    html = TEMPLATE.replace('/*__THREE_JS__*/', three)\
+                   .replace('/*__GEO__*/', json.dumps(geo, separators=(',',':')))\
+                   .replace('/*__TEX__*/', json.dumps(tex, separators=(',',':')))
     out = os.path.join(HERE, 'index.html')
     open(out, 'w', encoding='utf-8').write(html)
-    print('wrote', out, os.path.getsize(out), 'bytes; verts', len(verts), 'tris', len(faces))
+    print('wrote', out, os.path.getsize(out), 'bytes; verts', len(all_v), 'tris', len(all_f))
 
 TEMPLATE = r"""<!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8">
@@ -143,12 +178,12 @@ html,body{margin:0;height:100%;background:#11131a;overflow:hidden;font-family:sy
 button{background:#222838;color:#cfd6e4;border:1px solid #333b4d;border-radius:6px;padding:5px 10px;font-size:12px;touch-action:manipulation}
 #tip{font-size:11px;color:#8e99ae;margin-top:4px}
 #ref{position:fixed;left:8px;right:8px;bottom:8px;display:flex;gap:6px;justify-content:center;pointer-events:none}
-#ref img{height:76px;border:1px solid #2a2f3a;border-radius:4px;background:#fff;object-fit:contain;pointer-events:auto}
+#ref img{height:70px;border:1px solid #2a2f3a;border-radius:4px;background:#fff;object-fit:contain;pointer-events:auto}
 </style></head>
 <body>
 <canvas id="c"></canvas>
 <div id="hud">
-  <div><b>character-3d</b> · 三视图投影</div>
+  <div><b>character-3d</b> · 分段重建</div>
   <div id="btns"><button id="rot">⏸ 旋转</button><button id="wf">网格</button><button id="reset">重置</button></div>
   <div id="tip">拖拽旋转 · 滚轮缩放</div>
 </div>
@@ -183,9 +218,7 @@ function mkTex(url){
   img.src = url;
   return t;
 }
-const frontTex = mkTex(TEX.front);
-const sideTex  = mkTex(TEX.side);
-const backTex  = mkTex(TEX.back);
+const frontTex = mkTex(TEX.front), sideTex = mkTex(TEX.side), backTex = mkTex(TEX.back);
 
 const mat = new THREE.ShaderMaterial({
   uniforms:{
@@ -213,13 +246,12 @@ const mat = new THREE.ShaderMaterial({
       vec3 cb = texture2D(backTex, vUb).rgb;
       vec3 cs = texture2D(sideTex, vUs).rgb;
       float nz = vN.z, nx = abs(vN.x);
-      // 三向硬切 + 小过渡，避免图腾柱混叠
-      float wf = smoothstep(0.55, 0.75, nz);
-      float wb = smoothstep(0.55, 0.75, -nz);
-      float ws = smoothstep(0.60, 0.80, nx);
+      // 硬切 + 小过渡：避免图腾柱混叠
+      float wf = smoothstep(0.50, 0.72, nz);
+      float wb = smoothstep(0.50, 0.72, -nz);
+      float ws = smoothstep(0.62, 0.82, nx);
       float s = wf + wb + ws + 1e-4;
       vec3 col = (cf*wf + cb*wb + cs*ws) / s;
-      // gamma 微调让贴图不要太暗
       col = pow(col, vec3(0.9));
       gl_FragColor = vec4(col, 1.0);
     }`
@@ -246,15 +278,15 @@ document.getElementById('reset').onclick = ()=>{az=0;pol=1.15;dist=3.2;};
 
 function resize(){
   const w=window.innerWidth, h=window.innerHeight;
-  const rw=Math.floor(w*(window.devicePixelRatio||1));
-  const rh=Math.floor(h*(window.devicePixelRatio||1));
+  const dpr = Math.min(window.devicePixelRatio||1, 1.5);
+  const rw=Math.floor(w*dpr), rh=Math.floor(h*dpr);
   if(cv.width!==rw||cv.height!==rh){cv.width=rw;cv.height=rh;}
   renderer.setSize(w,h,false);
   camera.aspect=w/h; camera.updateProjectionMatrix();
 }
 function loop(){
   resize();
-  if(rot && !dragging) az += 0.006;
+  if(rot && !dragging) az += 0.005;
   const x = dist*Math.sin(pol)*Math.sin(az);
   const y = H3D*0.45 + dist*Math.cos(pol);
   const z = dist*Math.sin(pol)*Math.cos(az);
