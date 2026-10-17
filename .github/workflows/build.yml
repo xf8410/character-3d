@@ -5,7 +5,7 @@ on:
   push:
     paths:
       - 'gen.py'
-      - 'check_silhouette.py'
+      - 'check_parts.py'
       - 'views/**'
       - 'vendor/**'
       - '.github/workflows/build.yml'
@@ -27,11 +27,11 @@ jobs:
       - name: Install deps
         run: pip install --no-cache-dir pillow numpy
 
-      - name: Generate index.html (轮廓放样 + 三向投影)
+      - name: Generate index.html (多部件 Q 版实体建模)
         run: python3 gen.py
 
-      - name: Verify silhouette matches reference
-        run: python3 check_silhouette.py
+      - name: Verify multi-part model integrity
+        run: python3 check_parts.py
 
       - name: Commit built artifact
         run: |
