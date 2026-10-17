@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+<title>3D 模型查看器</title>
+<style>
+  :root { --bar: rgba(20,22,28,.72); --accent:#7c5cff; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { margin:0; height:100%; overflow:hidden;
+    font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+    background:#0e0f13; color:#fff; }
+  .grad { position:fixed; inset:0; z-index:-1;
+    background:radial-gradient(120% 120% at 50% 0%, #2a2d3a 0%, #14151c 55%, #0b0c10 100%); }
+  #c { position:fixed; inset:0; width:100%; height:100%; display:block; touch-action:none; }
+  #bar { position:fixed; left:50%; transform:translateX(-50%);
+    bottom:max(14px, env(safe-area-inset-bottom)); display:flex; gap:10px;
+    padding:8px; background:var(--bar); backdrop-filter:blur(10px);
+    border-radius:16px; box-shadow:0 6px 24px rgba(0,0,0,.45); }
+  .btn { appearance:none; border:0; color:#fff; background:rgba(255,255,255,.10);
+    padding:12px 16px; border-radius:12px; font-size:14px; font-weight:600; min-width:66px; }
+  .btn:active { background:rgba(255,255,255,.20); }
+  .btn.on { background:var(--accent); }
+  #status { position:fixed; top:max(14px,env(safe-area-inset-top)); left:50%;
+    transform:translateX(-50%); padding:10px 16px; background:var(--bar);
+    border-radius:12px; font-size:14px; max-width:90vw; text-align:center;
+    backdrop-filter:blur(10px); transition:opacity .3s; }
+  #status.hide { opacity:0; pointer-events:none; }
+  #hint { position:fixed; bottom:86px; left:50%; transform:translateX(-50%);
+    color:#9aa; font-size:12px; text-align:center; width:90vw; opacity:.85; }
+  .spin { display:inline-block; width:14px; height:14px; border:2px solid rgba(255,255,255,.3);
+    border-top-color:#fff; border-radius:50%; animation:sp .8s linear infinite;
+    vertical-align:-2px; margin-right:6px; }
+  @keyframes sp { to { transform:rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="grad"></div>
+<canvas id="c"></canvas>
+<div id="status"><span class="spin"></span>正在加载模型…</div>
+<div id="hint">单指旋转 · 双指缩放/平移</div>
+<div id="bar">
+  <button class="btn" id="reset">重置视角</button>
+  <button class="btn on" id="rotate">自动旋转</button>
+  <button class="btn" id="wire">线框</button>
+</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "./vendor/three.module.js",
+  "three/addons/": "./vendor/jsm/"
+}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
+
+const canvas = document.getElementById('c');
+const statusEl = document.getElementById('status');
+const params = new URLSearchParams(location.search);
+const modelUrl = params.get('model') || './model.glb';
+
+let renderer, scene, camera, controls, model;
+let autoRotate = true;
+
+init();
+loadModel(modelUrl);
+
+function init() {
+  renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.05;
+
+  scene = new THREE.Scene();
+  camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.01, 100);
+  camera.position.set(0, 0.6, 2.2);
+
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x444466, 1.15));
+  const key = new THREE.DirectionalLight(0xffffff, 2.0);
+  key.position.set(2, 3, 2); scene.add(key);
+  const fill = new THREE.DirectionalLight(0x88aaff, 0.6);
+  fill.position.set(-2, 1, -2); scene.add(fill);
+
+  const grid = new THREE.GridHelper(4, 16, 0x555566, 0x333344);
+  grid.material.opacity = 0.22; grid.material.transparent = true;
+  scene.add(grid);
+
+  controls = new OrbitControls(camera, canvas);
+  controls.enableDamping = true; controls.dampingFactor = 0.08;
+  controls.minDistance = 0.3; controls.maxDistance = 20;
+  controls.autoRotate = autoRotate; controls.autoRotateSpeed = 1.2;
+  controls.target.set(0, 0.4, 0);
+
+  addEventListener('resize', onResize);
+  onResize();
+  renderer.setAnimationLoop(animate);
+}
+
+function onResize() {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight, false);
+}
+
+function animate() {
+  controls.autoRotate = autoRotate;
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+function frameModel(radius) {
+  camera.position.set(0, radius * 0.5, radius * 2.2);
+  controls.target.set(0, radius * 0.5, 0);
+  controls.update();
+}
+
+function loadModel(url) {
+  const loader = new GLTFLoader();
+  loader.setMeshoptDecoder(MeshoptDecoder);
+  loader.load(url, (gltf) => {
+    if (model) { scene.remove(model); disposeObj(model); }
+    model = gltf.scene;
+
+    const box = new THREE.Box3().setFromObject(model);
+    const size = box.getSize(new THREE.Vector3());
+    const center = box.getCenter(new THREE.Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z) || 1;
+    const scale = 1.2 / maxDim;
+    model.position.sub(center);
+    model.scale.setScalar(scale);
+    const box2 = new THREE.Box3().setFromObject(model);
+    model.position.y -= box2.min.y;     // 脚底落到 y=0
+    scene.add(model);
+
+    frameModel(maxDim * scale);
+    statusEl.classList.add('hide');
+  }, (xhr) => {
+    if (xhr.total) {
+      const p = Math.floor(xhr.loaded / xhr.total * 100);
+      statusEl.innerHTML = '<span class="spin"></span>加载中 ' + p + '%';
+    }
+  }, (err) => {
+    statusEl.style.background = 'rgba(120,30,30,.82)';
+    statusEl.innerHTML = '⚠️ 未找到模型文件<br>请把 Tripo 生成的 <b>model.glb</b> 放在本页面同目录';
+    console.error(err);
+  });
+}
+
+function disposeObj(o) {
+  o.traverse(n => {
+    if (n.geometry) n.geometry.dispose();
+    if (n.material) (Array.isArray(n.material) ? n.material : [n.material])
+      .forEach(x => x && x.dispose());
+  });
+}
+
+document.getElementById('reset').onclick = () => {
+  if (!model) return;
+  const box = new THREE.Box3().setFromObject(model);
+  const r = Math.max(box.max.x - box.min.x, box.max.y - box.min.y, box.max.z - box.min.z);
+  frameModel(r);
+};
+const rotBtn = document.getElementById('rotate');
+rotBtn.onclick = () => { autoRotate = !autoRotate; rotBtn.classList.toggle('on', autoRotate); };
+const wireBtn = document.getElementById('wire');
+wireBtn.onclick = () => {
+  if (!model) return;
+  let on = false;
+  model.traverse(n => {
+    if (n.material) (Array.isArray(n.material) ? n.material : [n.material]).forEach(x => {
+      if (x.wireframe !== undefined) { x.wireframe = !x.wireframe; on = x.wireframe; }
+    });
+  });
+  wireBtn.classList.toggle('on', on);
+};
+</script>
+</body>
+</html>
