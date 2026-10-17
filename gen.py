@@ -103,10 +103,8 @@ def main():
             j2 = (j+1)%M
             a = i*M + j; b = i*M + j2; c = (i+1)*M + j2; d = (i+1)*M + j
             faces.append([a,b,c]); faces.append([a,c,d])
-    for j in range(M):
-        j2 = (j+1)%M
-        faces.append([top_c, j, j2])
-        faces.append([bot_c, (N-1)*M + j2, (N-1)*M + j])
+    # 去掉顶部/底部单点扇形封口：它们是产生黑白大三角的元凶。
+    # 依靠 shape_mod 顶部渐缩 + 底部裙摆自然张开，几何保持连续无缝。
 
     tex = {
         'front': resize_tex(os.path.join(HERE, 'views/front.png')),
@@ -199,7 +197,7 @@ const mat = new THREE.ShaderMaterial({
       vN = normalize(normalMatrix * normal);
       gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);
     }`,
-  fragmentShader:`
+    fragmentShader:`
     precision highp float;
     uniform sampler2D frontTex, sideTex, backTex;
     varying vec2 vUf; varying vec2 vUs; varying vec2 vUb; varying vec3 vN;
@@ -207,12 +205,12 @@ const mat = new THREE.ShaderMaterial({
       vec3 cf = texture2D(frontTex, vUf).rgb;
       vec3 cb = texture2D(backTex, vUb).rgb;
       vec3 cs = texture2D(sideTex, vUs).rgb;
-      float nz = vN.z, nx = abs(vN.x);
-      float wf = smoothstep(0.50, 0.72, nz);
-      float wb = smoothstep(0.50, 0.72, -nz);
-      float ws = smoothstep(0.62, 0.82, nx);
-      float s = wf + wb + ws + 1e-4;
-      vec3 col = (cf*wf + cb*wb + cs*ws) / s;
+      // 连续三向混合：用正面(+z)、背面(-z)、侧面(|x|)的绝对法线分量，加偏置避免 45° 区域全黑。
+      vec3 w = vec3(max(vN.z,0.0), max(-vN.z,0.0), abs(vN.x));
+      w = pow(w, vec3(0.75));          // 压低高权重、抬起低权重，过渡更软
+      w += 0.06;                       // 保证任何朝向都有基础权重，消除暗带
+      float s = w.x + w.y + w.z;
+      vec3 col = (cf*w.x + cb*w.y + cs*w.z) / s;
       col = pow(col, vec3(0.9));
       gl_FragColor = vec4(col, 1.0);
     }`
