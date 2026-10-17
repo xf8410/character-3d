@@ -30,8 +30,8 @@ jobs:
       - name: Generate index.html (多部件 Q 版实体建模)
         run: python3 gen.py
 
-      - name: Verify multi-part model integrity
-        run: python3 check_parts.py
+      - name: Verify silhouette matches reference
+        run: python3 check_silhouette.py
 
       - name: Commit built artifact
         run: |

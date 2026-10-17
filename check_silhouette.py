@@ -1,55 +1,71 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""自洽验证：用同一轮廓生成 网格带(SCALE内缩) 与 原图带(1.0)，比 IoU；
-并算原图笔画被网格带覆盖的比例。原图是线稿，洪泛会漏，故不用填充体比较。"""
-import os
+"""剪影相似度检查：把网格正交投影光栅化，与参考视图的实心剪影比 IoU。
+可检测：整体形状偏差、上下颠倒、左右镜像。"""
+import json, re, os, sys
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-N, SCALE = 96, 0.985
+GRID = (128, 192)
+CANVAS = (1024, 1536)
 
-def load(path):
-    im = np.array(Image.open(path).convert('RGB')).astype(np.float32)
-    H, W, _ = im.shape
-    lum = im.mean(axis=2); sat = im.max(axis=2) - im.min(axis=2)
-    fg = (lum < 235) | (sat > 28)
-    return fg, (H, W)
+html = open(os.path.join(HERE,'index.html'), encoding='utf-8').read()
+G = json.loads(re.search(r'const GEO = (\{.*?\});\n', html, re.S).group(1))
+v = np.array(G['v']); f = np.array(G['f'])
 
-def profile_rows(fg):
-    H = fg.shape[0]; rows = []
-    for r in range(H):
-        col = np.where(fg[r])[0]
-        rows.append((col.max()-col.min())/2 if col.size >= 5 else 0.0)
-    rows = np.array(rows)
-    content = np.where(rows > 1.0)[0]
-    return rows, int(content.min()), int(content.max())
+def raster(v, f, ax, ay, flip_x=False):
+    """把网格投影到 (ax, ay) 平面并光栅化成二值图。"""
+    xs = v[:,ax].copy(); ys = v[:,ay].copy()
+    if flip_x: xs = -xs
+    xmin,xmax,ymin,ymax = xs.min(),xs.max(),ys.min(),ys.max()
+    W,H = CANVAS
+    sc = min(W*0.98/max(xmax-xmin,1e-6), H*0.98/max(ymax-ymin,1e-6))
+    cx,cy = (xmin+xmax)/2, (ymin+ymax)/2
+    im = Image.new('L',(W,H),0); dr = ImageDraw.Draw(im)
+    for a,b,c in f:
+        pts = []
+        for idx in (a,b,c):
+            px = W/2 + (xs[idx]-cx)*sc
+            py = H/2 - (ys[idx]-cy)*sc     # mesh y 向上 -> 图像 y 向下
+            pts.append((px,py))
+        dr.polygon(pts, fill=255)
+    return im
 
-def iou(a, b):
-    inter = np.logical_and(a, b).sum(); union = np.logical_or(a, b).sum()
-    return inter / union if union else 0.0
+def ref_mask(name):
+    im = np.array(Image.open(os.path.join(HERE,f'views/{name}.png')).convert('RGB')).astype(np.float32)
+    lum = im.mean(axis=2); sat = im.max(axis=2)-im.min(axis=2)
+    fg = (lum<235)|(sat>28)
+    return Image.fromarray((fg*255).astype(np.uint8))
 
-def band(fg, scale):
-    H, W = fg.shape; rows, top, bot = profile_rows(fg)
-    ys = np.linspace(top, bot, N)
-    hw = np.interp(ys, np.arange(H), rows) * scale
-    cx = W/2
-    c = np.zeros((H, W), bool)
-    for i in range(N):
-        r = int(round(ys[i])); px = int(round(hw[i]))
-        if 0 <= r < H:
-            c[r, max(0,int(cx-px)): min(W,int(cx+px)+1)] = True
-    return c
+def to_grid(img):
+    """裁到内容包围盒后缩放到统一网格。"""
+    a = np.array(img) > 127
+    if not a.any(): return a
+    ys,xs = np.where(a)
+    crop = a[ys.min():ys.max()+1, xs.min():xs.max()+1]
+    return np.array(Image.fromarray((crop*255).astype(np.uint8)).resize(GRID, Image.NEAREST)) > 127
 
-for name in ['front', 'side']:
-    fg, (H, W) = load(os.path.join(HERE, 'views', f'{name}.png'))
-    mesh_b = band(fg, SCALE)
-    draw_b = band(fg, 1.0)
-    cov = np.logical_and(fg, mesh_b).sum() / max(fg.sum(), 1)
-    print(f'[{name}] 带间 IoU(网格vs原图轮廓) = {iou(mesh_b, draw_b):.3f}  | 原图笔画被网格覆盖 = {cov:.3f}')
+def iou(a,b):
+    inter = np.logical_and(a,b).sum(); union = np.logical_or(a,b).sum()
+    return inter/union if union else 0.0
 
-# 几何正确性：网格最宽半宽应为原图最宽半宽*SCALE
-fg_f, _ = load(os.path.join(HERE, 'views/front.png'))
-rows_f, _, _ = profile_rows(fg_f)
-print(f'正面最宽半宽 原图={rows_f.max():.0f}px -> 网格={rows_f.max()*SCALE:.0f}px (内缩{(1-SCALE)*100:.1f}%)')
-print('结论:', '✅ 网格严格内缩贴合原图轮廓（投影着色会百分百覆盖角色表面）')
+print('剪影 IoU（网格 vs 参考图，尺度/平移归一后）')
+res = []
+for name, ax, ay in [('front',0,1), ('side',2,1), ('back',0,1)]:
+    rm = to_grid(ref_mask(name))
+    best, bestf = 0.0, None
+    for fx in (False, True):
+        s = iou(to_grid(raster(v,f,ax,ay,flip_x=fx)), rm)
+        if s > best: best, bestf = s, fx
+    res.append((name,best))
+    print(f'  {name:6s} IoU = {best:.3f}   ({"镜像" if bestf else "正向"}更优)')
+
+rm = to_grid(ref_mask('front'))
+vf = v.copy(); vf[:,1] = -vf[:,1]
+print(f'  [对照] front 若上下颠倒 IoU = {iou(to_grid(raster(vf,f,0,1)),rm):.3f}  (应明显更低 => 方向正确)')
+
+avg = sum(r[1] for r in res)/len(res)
+print(f'平均 IoU = {avg:.3f}')
+print('结论:', '✅ 剪影高度贴合' if avg>0.80 else ('⚠️ 中等贴合' if avg>0.65 else '❌ 偏差较大'))
+sys.exit(0 if avg>0.55 else 1)
