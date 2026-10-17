@@ -94,13 +94,25 @@ def main():
         'v': verts, 'f': faces,
         'aRow': aRow, 'aCxF': aCxF, 'aCxS': aCxS,
         'Wf': fW, 'Hf': fH, 'Ws': sW, 'Hs': sH, 'Kf': Kf, 'Ks': Ks,
+        'H3D': H3D,
     }
     geo_json = json.dumps(geo, separators=(',', ':'))
+
+    # 把三视图内联成 base64，避免 GitHub Pages/内嵌浏览器路径或 CORS 问题
+    import base64
+    def b64_png(path):
+        return 'data:image/png;base64,' + base64.b64encode(open(path, 'rb').read()).decode()
+    inline = {'front': b64_png(os.path.join(HERE, 'views/front.png')),
+              'side':  b64_png(os.path.join(HERE, 'views/side.png')),
+              'back':  b64_png(os.path.join(HERE, 'views/back.png'))}
+    inline_json = json.dumps(inline, separators=(',', ':'))
 
     three = open(os.path.join(HERE, 'vendor/three.min.js'), encoding='utf-8').read()
     three = three.replace('</script', '<\\/script')
 
-    html = TEMPLATE.replace('/*__THREE_JS__*/', three).replace('/*__GEO__*/', geo_json)
+    html = TEMPLATE.replace('/*__THREE_JS__*/', three)\
+                   .replace('/*__GEO__*/', geo_json)\
+                   .replace('/*__TEX__*/', inline_json)
     out = os.path.join(HERE, 'index.html')
     open(out, 'w', encoding='utf-8').write(html)
     print('wrote', out, os.path.getsize(out), 'bytes; verts', len(verts), 'tris', len(faces))
@@ -123,18 +135,24 @@ button{background:#222838;color:#cfd6e4;border:1px solid #333b4d;border-radius:6
   <div><button id="rot">⏸ 旋转</button><button id="wf">网格</button><button id="reset">重置视角</button></div>
   <div id="tip">拖拽旋转 · 滚轮缩放</div>
 </div>
-<div id="ref"><img src="views/front.png"><img src="views/side.png"><img src="views/back.png"></div>
+<div id="ref"><img id="rfront"><img id="rside"><img id="rback"></div>
 <script>/*__THREE_JS__*/</script>
 <script>
 const GEO = /*__GEO__*/;
+const TEX = /*__TEX__*/;
+const H3D = GEO.H3D;
 const canvas = document.getElementById('c');
-const renderer = new THREE.WebGLRenderer({canvas, antialias:true});
-renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+
+const renderer = new THREE.WebGLRenderer({canvas, antialias:true, alpha:false});
+renderer.setPixelRatio(Math.min(window.devicePixelRatio||1,2));
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x11131a);
-const camera = new THREE.PerspectiveCamera(35, 1, 0.1, 100);
-const camTarget = new THREE.Vector3(0, H3D*0.5, 0);
-camera.position.set(1.4, H3D*0.7, 3.0);
+const camera = new THREE.PerspectiveCamera(40, canvas.clientWidth/canvas.clientHeight||1, 0.05, 100);
+const camTarget = new THREE.Vector3(0, H3D*0.45, 0);
+camera.position.set(0, H3D*0.55, 3.2);
+
+// 简单错误兜底：如果 H3D 无效就用默认值
+if(!isFinite(H3D)){ alert('渲染数据异常，请重试'); throw new Error('H3D missing'); }
 
 const geo = new THREE.BufferGeometry();
 geo.setAttribute('position', new THREE.Float32BufferAttribute(GEO.v.flat(), 3));
@@ -148,12 +166,18 @@ function mkTex(url){
   const t = new THREE.Texture();
   const img = new Image();
   img.onload = ()=>{ t.image = img; t.flipY = false; t.needsUpdate = true; };
+  img.onerror = ()=>{ console.error('tex load failed', url.slice(0,60)); };
   img.src = url;
   return t;
 }
-const frontTex = mkTex('views/front.png');
-const sideTex  = mkTex('views/side.png');
-const backTex  = mkTex('views/back.png');
+const frontTex = mkTex(TEX.front);
+const sideTex  = mkTex(TEX.side);
+const backTex  = mkTex(TEX.back);
+
+// 把右上角参考图也填上 base64
+for(const [id, url] of [['rfront',TEX.front],['rside',TEX.side],['rback',TEX.back]]){
+  const el=document.getElementById(id); if(el) el.src=url;
+}
 
 const mat = new THREE.ShaderMaterial({
   uniforms:{
