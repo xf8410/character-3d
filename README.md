@@ -1,15 +1,37 @@
 # character-3d
 
-程序化 Three.js 角色模型 + 参考图投影重建（Q 版马耳少女 / ウマ娘风格）。
+用**仓库 CI** 从零构建的 3D 角色项目：从正交参考图（正/侧/背）重建可旋转的 3D 模型，不依赖任何商业 3D API、不需要 GPU。
 
-## 内容
-- `index.html` —— 最新交互查看器（五层显隐：骨架/皮肤/衣服/头发/装饰，自动旋转，材质滑杆）
-- `views/` —— 原始正交三视图（正/侧/背）
-- `proj/` —— 对齐后的投影贴图 + 剪影剖面元数据（来自原图的轮廓驱动）
-- `ref_character.png` / `three_view_sheet.png` / `ref_style_sheet.png` —— 参考图
-- `inspect/` —— 离线逐层渲染检查图（7 视角 × 5 图层）
-- `source/` —— 建模源模板与构建/检查脚本
+## 思路（来自公开资料研究）
 
-## 说明
-本沙箱无 GPU / 无 WebGL，模型为程序化几何 + 三视图投影贴图。
-真·神经图生 3D（Hunyuan3D-2 / TRELLIS）需 GPU，未在本环境运行。
+1. **轮廓放样 (silhouette loft)**：从三张正交参考图逐行提取轮廓半宽，用「正面半宽→X 半径、侧面半宽→Z 半径」放样出网格，使模型的正视/侧视剪影严格等于原图。
+2. **三向平面投影 (tri-planar / planar projection)**：自定义着色器把正/侧/背三张原图分别投影到朝外表面（+Z 正面、−Z 背面、±X 侧面），按法线加权混合。颜色、五官、金饰、裙褶全部来自原图，不做程序化近似——这是"像原图"的关键。
+
+> 参考：[img2threejs](https://github.com/img2threejs/img2threejs) 的 projection-first fidelity 方法论；Three.js 纹理投影（Codrops）、三平面映射（triplanar）等公开资料。
+
+## 本地构建
+
+```bash
+pip install pillow numpy
+python3 gen.py              # 生成 index.html（内联 three.js，贴图引用 views/*.png）
+python3 check_silhouette.py # 验证网格剪影 IoU≈0.98 贴合原图
+```
+
+## 通过 CI 构建（推荐）
+
+仓库已配置 GitHub Actions（`build.yml`）：
+
+- 在仓库 **Actions → build3d → Run workflow** 手动触发；或 push 到 `gen.py`/`views/`/`vendor/` 自动触发。
+- CI 跑 `gen.py` 生成 `index.html`，自检剪影，并把成果 `commit` 回 `main`。
+- **GitHub Pages** 自动部署：https://xf8410.github.io/character-3d/
+
+## 目录
+
+| 路径 | 说明 |
+|---|---|
+| `gen.py` | 核心生成器：轮廓提取 + 放样 + 投影着色器，输出自包含 `index.html` |
+| `check_silhouette.py` | 量化验证网格剪影贴合原图（IoU） |
+| `views/` | 干净正交参考图（正/侧/背） |
+| `vendor/three.min.js` | 内联的 Three.js r152 |
+| `.github/workflows/build.yml` | CI 构建工作流 |
+| `index.html` | 最新成果（CI 生成，可直接打开 / Pages 部署） |
