@@ -1,0 +1,54 @@
+name: Tripo 图生3D 并部署 Pages
+
+# 默认手动触发,避免你还没填 API Key 就跑失败。
+# 等你把 Secret 加好后,可以取消下面 push 段的注释改成自动触发。
+on:
+  workflow_dispatch:
+  # push:
+  #   branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 用 Tripo V3 API 生成 model.glb
+        env:
+          TRIPO_API_KEY: ${{ secrets.TRIPO_API_KEY }}
+          # 如果在国内网络连不上全局节点,把下面这行取消注释
+          # TRIPO_CHINA: "1"
+        run: |
+          # 默认用最高质量 v3.1,手机想要低面数可改成 P1-20260311
+          ARGS="--image inputs/ref_chibi.png --output model.glb"
+          if [ -n "$TRIPO_CHINA" ]; then ARGS="$ARGS --china"; fi
+          python3 gen_tripo.py $ARGS
+          ls -lh model.glb
+
+      - name: 上传到 GitHub Pages 产物
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./
+          # 产物名默认 github-pages
+
+      - name: 部署到 GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
