@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+<title>角色 3D 模型</title>
+<style>
+  :root { --ink:#2b2f3a; --muted:#8a90a2; --accent:#6c5ce7; --card:#ffffff; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { margin:0; height:100%; overflow:hidden;
+    font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+    color:var(--ink); }
+  /* 明亮柔和背景 —— 不再是黑色 */
+  .bg { position:fixed; inset:0; z-index:-1;
+    background:linear-gradient(160deg,#fdfbf7 0%,#eef1f8 45%,#e6ebf5 100%); }
+  #c { position:fixed; inset:0; width:100%; height:100%; display:block; touch-action:none; }
+
+  /* ===== 无模型时的友好占位卡片 ===== */
+  #placeholder { position:fixed; inset:0; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; padding:24px; text-align:center; }
+  #placeholder .art { width:min(62vw,260px); aspect-ratio:3/4; border-radius:20px;
+    object-fit:cover; object-position:top center; background:#fff;
+    box-shadow:0 18px 50px rgba(60,70,110,.18); border:1px solid rgba(255,255,255,.7); }
+  #placeholder h1 { font-size:19px; margin:22px 0 8px; font-weight:700; }
+  #placeholder p { font-size:14px; color:var(--muted); line-height:1.7;
+    max-width:320px; margin:0; }
+  #placeholder .steps { margin-top:20px; font-size:12.5px; color:var(--muted);
+    line-height:2; text-align:left; display:inline-block; }
+  #placeholder .pill { display:inline-block; margin-top:20px; padding:10px 20px;
+    background:var(--accent); color:#fff; border-radius:999px; font-size:13.5px; font-weight:600;
+    box-shadow:0 6px 18px rgba(108,92,231,.3); }
+
+  /* ===== 3D 模式下的 UI ===== */
+  #ui { display:none; }
+  #ui.show { display:block; }
+  #bar { position:fixed; left:50%; transform:translateX(-50%);
+    bottom:max(16px, env(safe-area-inset-bottom)); display:flex; gap:8px;
+    padding:7px; background:rgba(255,255,255,.86); backdrop-filter:blur(12px);
+    border-radius:16px; box-shadow:0 8px 28px rgba(60,70,110,.16); }
+  .btn { appearance:none; border:0; color:var(--ink); background:rgba(108,92,231,.08);
+    padding:11px 15px; border-radius:11px; font-size:13.5px; font-weight:600; min-width:64px; }
+  .btn:active { transform:scale(.96); }
+  .btn.on { background:var(--accent); color:#fff; }
+  #status { display:none; position:fixed; top:max(16px,env(safe-area-inset-top)); left:50%;
+    transform:translateX(-50%); padding:10px 18px; background:rgba(255,255,255,.9);
+    border-radius:999px; font-size:13px; color:var(--ink); max-width:90vw;
+    text-align:center; box-shadow:0 6px 20px rgba(60,70,110,.12);
+    backdrop-filter:blur(12px); transition:opacity .3s; }
+  #status.show { display:block; }
+  #status.hide { opacity:0; pointer-events:none; }
+  #hint { display:none; position:fixed; bottom:82px; left:50%; transform:translateX(-50%);
+    color:var(--muted); font-size:12px; text-align:center; width:90vw; }
+  #hint.show { display:block; }
+  .spin { display:inline-block; width:13px; height:13px; border:2px solid rgba(108,92,231,.25);
+    border-top-color:var(--accent); border-radius:50%; animation:sp .8s linear infinite;
+    vertical-align:-2px; margin-right:7px; }
+  @keyframes sp { to { transform:rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="bg"></div>
+<canvas id="c" style="display:none"></canvas>
+
+<!-- 默认:立绘预览卡片(轻量、秒开) -->
+<div id="placeholder">
+  <img class="art" src="./inputs/ref_chibi.png" alt="角色立绘" />
+  <h1 id="ph-title">3D 模型待生成</h1>
+  <p id="ph-desc">这张立绘已准备好。生成 3D 模型后,本页面会自动显示可旋转的 3D 版本。</p>
+  <div class="steps" id="ph-steps">
+    ① 注册 Tripo 拿到 API Key<br>
+    ② 在仓库 Secrets 里填入 TRIPO_API_KEY<br>
+    ③ 触发 CI,生成 model.glb 后自动上线
+  </div>
+  <span class="pill">参考图已就绪 ✨</span>
+</div>
+
+<!-- 3D 模式 UI -->
+<div id="status"><span class="spin"></span>准备中…</div>
+<div id="hint">单指旋转 · 双指缩放/平移</div>
+<div id="ui">
+  <div id="bar">
+    <button class="btn" id="reset">重置视角</button>
+    <button class="btn on" id="rotate">自动旋转</button>
+    <button class="btn" id="wire">线框</button>
+  </div>
+</div>
+
+<script type="module">
+  const canvas = document.getElementById('c');
+  const statusEl = document.getElementById('status');
+  const params = new URLSearchParams(location.search);
+  const modelUrl = params.get('model') || './model.glb';
+
+  // 1) 先探测模型是否存在(HEAD),不存在就停留在立绘卡片 —— 秒开,零 3D 开销
+  async function modelExists(url) {
+    try {
+      const r = await fetch(url, { method: 'HEAD', cache: 'no-store' });
+      if (!r.ok) return false;
+      const len = Number(r.headers.get('content-length') || 0);
+      return len > 1024; // 排除错误页/占位文件
+    } catch { return false; }
+  }
+
+  async function boot() {
+    if (!(await modelExists(modelUrl))) return; // 保持占位卡片
+
+    // 2) 有模型才加载 3D 引擎(570KB,且走 gzip)
+    document.getElementById('placeholder').style.display = 'none';
+    canvas.style.display = 'block';
+    document.getElementById('ui').classList.add('show');
+    statusEl.classList.add('show');
+    document.getElementById('hint').classList.add('show');
+    statusEl.innerHTML = '<span class="spin"></span>正在加载 3D 引擎…';
+
+    let createViewer;
+    try {
+      ({ createViewer } = await import('./viewer3d.js'));
+    } catch (e) {
+      statusEl.innerHTML = '⚠️ 3D 引擎加载失败,请刷新重试';
+      return;
+    }
+    const viewer = createViewer(canvas, {
+      onProgress: p => { statusEl.innerHTML = '<span class="spin"></span>加载模型 ' + Math.round(p * 100) + '%'; },
+      onError: () => { statusEl.innerHTML = '⚠️ 模型加载失败,请检查 model.glb'; },
+    });
+    await viewer.load(modelUrl);
+    statusEl.classList.add('hide');
+
+    let autoRotate = true;
+    const rotBtn = document.getElementById('rotate');
+    rotBtn.onclick = () => { autoRotate = !autoRotate; viewer.setRotate(autoRotate); rotBtn.classList.toggle('on', autoRotate); };
+    document.getElementById('reset').onclick = () => viewer.reset();
+    const wireBtn = document.getElementById('wire');
+    wireBtn.onclick = () => wireBtn.classList.toggle('on', viewer.toggleWire());
+  }
+
+  boot();
+</script>
+</body>
+</html>

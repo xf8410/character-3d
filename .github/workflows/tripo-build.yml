@@ -43,6 +43,9 @@ jobs:
           python3 gen_tripo.py $ARGS
           ls -lh model.glb
 
+      - name: 确保主页存在
+        run: cp -f viewer.html index.html
+
       - name: 上传到 GitHub Pages 产物
         uses: actions/upload-pages-artifact@v3
         with:
